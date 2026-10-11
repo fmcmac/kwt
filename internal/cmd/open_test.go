@@ -56,15 +56,6 @@ type signalingOpenWorkspaceRunner struct {
 	ensure chan struct{}
 }
 
-func (r *signalingOpenWorkspaceRunner) Resolve(
-	_ context.Context,
-	request tmux.WorkspaceEndpointRequest,
-) (tmux.WorkspaceSession, error) {
-	return tmux.WorkspaceSession{
-		Endpoint: testCanonicalSessionEndpoint(request.SessionName),
-	}, nil
-}
-
 func (r *signalingOpenWorkspaceRunner) Establish(
 	context.Context, string, string, models.Layout,
 ) (tmux.SessionEndpoint, error) {
@@ -80,13 +71,20 @@ func (r *signalingOpenWorkspaceRunner) EstablishWithGeneration(
 	return r.Establish(ctx, sessionName, workingDirectory, layout)
 }
 
+func (r *signalingOpenWorkspaceRunner) EstablishExpectedWithGeneration(
+	ctx context.Context,
+	sessionName, _, workingDirectory, _ string,
+	layout models.Layout,
+) (tmux.SessionEndpoint, error) {
+	return r.Establish(ctx, sessionName, workingDirectory, layout)
+}
+
 func (r *signalingOpenWorkspaceRunner) Attach(context.Context, tmux.SessionEndpoint) error {
 	return nil
 }
 
 type recordingOpenWorkspaceRunner struct {
-	resolved         tmux.WorkspaceSession
-	resolveRequest   tmux.WorkspaceEndpointRequest
+	expectedSession  string
 	ensured          bool
 	attached         bool
 	sessionName      string
@@ -127,19 +125,6 @@ func markCommandFlagsChanged(t *testing.T, cmd *cobra.Command, names ...string) 
 	}
 }
 
-func (r *recordingOpenWorkspaceRunner) Resolve(
-	_ context.Context,
-	request tmux.WorkspaceEndpointRequest,
-) (tmux.WorkspaceSession, error) {
-	r.resolveRequest = request
-	if r.resolved.Endpoint.SessionName == "" {
-		return tmux.WorkspaceSession{
-			Endpoint: testCanonicalSessionEndpoint(request.SessionName),
-		}, nil
-	}
-	return r.resolved, nil
-}
-
 func (r *recordingOpenWorkspaceRunner) Establish(
 	_ context.Context, sessionName, workingDirectory string, layout models.Layout,
 ) (tmux.SessionEndpoint, error) {
@@ -163,6 +148,24 @@ func (r *recordingOpenWorkspaceRunner) EstablishWithGeneration(
 	endpoint, err := r.Establish(ctx, sessionName, workingDirectory, layout)
 	r.generation = generation
 	return endpoint, err
+}
+
+// EstablishExpectedWithGeneration mirrors the manager contract: an endpoint
+// other than the expected session is rejected before anything is ensured.
+func (r *recordingOpenWorkspaceRunner) EstablishExpectedWithGeneration(
+	ctx context.Context,
+	sessionName, expectedSession, workingDirectory, generation string,
+	layout models.Layout,
+) (tmux.SessionEndpoint, error) {
+	r.expectedSession = expectedSession
+	resolved := r.endpoint.SessionName
+	if resolved == "" {
+		resolved = sessionName
+	}
+	if resolved != expectedSession {
+		return tmux.SessionEndpoint{}, tmux.ErrWorkspaceSessionChanged
+	}
+	return r.EstablishWithGeneration(ctx, sessionName, workingDirectory, generation, layout)
 }
 
 func (r *recordingOpenWorkspaceRunner) Attach(
@@ -1293,12 +1296,16 @@ func setupGuardedBranchChangeOpen(t *testing.T) guardedBranchChangeOpen {
 		tmux.WorkspaceSessionName(info, "main-follow-up", worktreePath),
 	)
 	generation := tuiTestWorktreeGeneration(t, repoPath, worktreePath)
+	reg, err := registry.New()
+	require.NoError(t, err)
+	require.NoError(t, reg.Register(&registry.WorktreeEntry{
+		Path:                   worktreePath,
+		Branch:                 "main-follow-up",
+		Generation:             generation,
+		UnreviewedRemoteSource: true,
+	}))
 
 	runner := &recordingOpenWorkspaceRunner{
-		resolved: tmux.WorkspaceSession{
-			Endpoint: testCanonicalSessionEndpoint(retainedSession),
-			Live:     true,
-		},
 		endpoint: testCanonicalSessionEndpoint(retainedSession),
 	}
 	originalRunner := newOpenWorkspaceRunner
@@ -1333,6 +1340,13 @@ func setupGuardedBranchChangeOpen(t *testing.T) guardedBranchChangeOpen {
 	}
 }
 
+func (g guardedBranchChangeOpen) remoteSourceUnreviewed(t *testing.T) bool {
+	t.Helper()
+	reg, err := registry.New()
+	require.NoError(t, err)
+	return reg.IsUnreviewedRemoteSource(g.worktreePath)
+}
+
 func (g guardedBranchChangeOpen) open(t *testing.T, startSession bool) error {
 	t.Helper()
 	entry, err := discovery.DiscoverWorktree(
@@ -1359,9 +1373,10 @@ func TestExpectedOpenUsesRetainedSessionAfterBranchChange(t *testing.T) {
 			err := guarded.open(t, startSession)
 
 			require.NoError(t, err)
-			assert.Equal(t, utils.PathKey(guarded.worktreePath), utils.PathKey(guarded.runner.resolveRequest.WorkspacePath))
-			assert.Equal(t, guarded.generation, guarded.runner.resolveRequest.WorkspaceGeneration)
+			assert.Equal(t, guarded.retainedSession, guarded.runner.expectedSession)
+			assert.Equal(t, utils.PathKey(guarded.worktreePath), utils.PathKey(guarded.runner.workingDirectory))
 			assert.True(t, guarded.runner.ensured)
+			assert.False(t, guarded.remoteSourceUnreviewed(t))
 			assert.Equal(t, guarded.generation, guarded.runner.generation)
 			assert.Equal(t, startSession, !guarded.runner.attached)
 			if !startSession {
@@ -1390,6 +1405,7 @@ func TestExpectedOpenRejectsMismatchedSessionAfterBranchChange(t *testing.T) {
 			assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
 			assert.False(t, guarded.runner.ensured)
 			assert.False(t, guarded.runner.attached)
+			assert.True(t, guarded.remoteSourceUnreviewed(t))
 		})
 	}
 }
@@ -1406,22 +1422,29 @@ func TestExpectedOpenRejectsStaleGenerationAfterBranchChange(t *testing.T) {
 			assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
 			assert.False(t, guarded.runner.ensured)
 			assert.False(t, guarded.runner.attached)
+			assert.True(t, guarded.remoteSourceUnreviewed(t))
 		})
 	}
 }
 
-func TestExpectedOpenRejectsEndpointThatDiffersFromResolvedSession(t *testing.T) {
-	guarded := setupGuardedBranchChangeOpen(t)
-	info, ok := url.CanonicalRepositoryInfo("github.com/acme/widget")
-	require.True(t, ok)
-	// The retained session ended between resolution and establishment, so
-	// establishment created a session under the current branch's name.
-	guarded.runner.endpoint = testCanonicalSessionEndpoint(
-		tmux.WorkspaceSessionName(info, "main-follow-up", guarded.worktreePath),
-	)
+func TestExpectedOpenDoesNotEnsureSessionWhenRetainedSessionExits(t *testing.T) {
+	for _, startSession := range []bool{false, true} {
+		t.Run(map[bool]string{false: "attach", true: "start only"}[startSession], func(t *testing.T) {
+			guarded := setupGuardedBranchChangeOpen(t)
+			info, ok := url.CanonicalRepositoryInfo("github.com/acme/widget")
+			require.True(t, ok)
+			// The retained session ends before establishment, which would
+			// otherwise create a session under the current branch's name.
+			guarded.runner.endpoint = testCanonicalSessionEndpoint(
+				tmux.WorkspaceSessionName(info, "main-follow-up", guarded.worktreePath),
+			)
 
-	err := guarded.open(t, false)
+			err := guarded.open(t, startSession)
 
-	assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
-	assert.False(t, guarded.runner.attached)
+			assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
+			assert.False(t, guarded.runner.ensured)
+			assert.False(t, guarded.runner.attached)
+			assert.True(t, guarded.remoteSourceUnreviewed(t))
+		})
+	}
 }

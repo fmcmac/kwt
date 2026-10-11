@@ -496,8 +496,9 @@ without a client creating it bare or bypassing protected attach policy. See
 Automation clients that pass `--expected-session` supply the worktree's
 `session_name` from inventory. A live session keeps the name of the branch it
 was created on, so kwt compares the flag to the resolved live endpoint rather
-than to a name derived from the current branch. Any other session fails with
-retryable `registration_changed` before tmux is touched.
+than to a name derived from the current branch. If that session has exited or
+resolves to any other session, the open fails with retryable
+`registration_changed` before kwt creates or repairs a session.
 `kwt open` and dashboard open actions refuse protected pull-request imports
 and direct the user through `kwt pr attach`.
 `created_at` and `generation` are populated in both local and `-g` mode.

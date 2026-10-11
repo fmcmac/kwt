@@ -39,9 +39,9 @@ var (
 )
 
 type openWorkspaceRunner interface {
-	Resolve(context.Context, tmux.WorkspaceEndpointRequest) (tmux.WorkspaceSession, error)
 	Establish(context.Context, string, string, models.Layout) (tmux.SessionEndpoint, error)
 	EstablishWithGeneration(context.Context, string, string, string, models.Layout) (tmux.SessionEndpoint, error)
+	EstablishExpectedWithGeneration(context.Context, string, string, string, string, models.Layout) (tmux.SessionEndpoint, error)
 	Attach(context.Context, tmux.SessionEndpoint) error
 }
 
@@ -570,38 +570,25 @@ func openExpectedWorktree(
 			protectedNames,
 			func(lockedSession string) error {
 				// Inventory reports the resolved endpoint. A live session
-				// keeps the name of the branch it was created on, so the
-				// expected session is compared to that endpoint rather than
-				// to the name derived from the current branch.
-				resolved, resolveErr := runner.Resolve(ctx, tmux.WorkspaceEndpointRequest{
-					SessionName:         lockedSession,
-					WorkspacePath:       current.Path,
-					WorkspaceGeneration: openExpectedGeneration,
-				})
-				if resolveErr != nil {
-					return resolveErr
-				}
-				if resolved.Endpoint.SessionName != openExpectedSession {
-					return registrationChangedOpenError(nil)
-				}
-				if err := acknowledgeRemoteSourcePath(current.Path); err != nil {
-					return err
-				}
+				// keeps the name of the branch it was created on, so
+				// establishment must resolve to the expected session rather
+				// than to the name derived from the current branch.
 				var establishErr error
-				endpoint, establishErr = runner.EstablishWithGeneration(
+				endpoint, establishErr = runner.EstablishExpectedWithGeneration(
 					ctx,
 					lockedSession,
+					openExpectedSession,
 					current.Path,
 					openExpectedGeneration,
 					layout,
 				)
+				if errors.Is(establishErr, tmux.ErrWorkspaceSessionChanged) {
+					return registrationChangedOpenError(establishErr)
+				}
 				if establishErr != nil {
 					return establishErr
 				}
-				if endpoint.SessionName != openExpectedSession {
-					return registrationChangedOpenError(nil)
-				}
-				return nil
+				return acknowledgeRemoteSourcePath(current.Path)
 			},
 		)
 		var conditionErr *shared.ConditionError
