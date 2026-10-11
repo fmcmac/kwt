@@ -493,6 +493,11 @@ attach-only client, or use `kwt pr attach <path>` when
 without a client creating it bare or bypassing protected attach policy. See
 [Attaching from other tools](#attaching-from-other-tools) before using
 `new-session`.
+Automation clients that pass `--expected-session` supply the worktree's
+`session_name` from inventory. A live session keeps the name of the branch it
+was created on, so kwt compares the flag to the resolved live endpoint rather
+than to a name derived from the current branch. Any other session fails with
+retryable `registration_changed` before tmux is touched.
 `kwt open` and dashboard open actions refuse protected pull-request imports
 and direct the user through `kwt pr attach`.
 `created_at` and `generation` are populated in both local and `-g` mode.

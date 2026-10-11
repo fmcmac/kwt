@@ -56,6 +56,15 @@ type signalingOpenWorkspaceRunner struct {
 	ensure chan struct{}
 }
 
+func (r *signalingOpenWorkspaceRunner) Resolve(
+	_ context.Context,
+	request tmux.WorkspaceEndpointRequest,
+) (tmux.WorkspaceSession, error) {
+	return tmux.WorkspaceSession{
+		Endpoint: testCanonicalSessionEndpoint(request.SessionName),
+	}, nil
+}
+
 func (r *signalingOpenWorkspaceRunner) Establish(
 	context.Context, string, string, models.Layout,
 ) (tmux.SessionEndpoint, error) {
@@ -76,6 +85,8 @@ func (r *signalingOpenWorkspaceRunner) Attach(context.Context, tmux.SessionEndpo
 }
 
 type recordingOpenWorkspaceRunner struct {
+	resolved         tmux.WorkspaceSession
+	resolveRequest   tmux.WorkspaceEndpointRequest
 	ensured          bool
 	attached         bool
 	sessionName      string
@@ -114,6 +125,19 @@ func markCommandFlagsChanged(t *testing.T, cmd *cobra.Command, names ...string) 
 		}
 		cmd.Flags().Lookup(name).Changed = true
 	}
+}
+
+func (r *recordingOpenWorkspaceRunner) Resolve(
+	_ context.Context,
+	request tmux.WorkspaceEndpointRequest,
+) (tmux.WorkspaceSession, error) {
+	r.resolveRequest = request
+	if r.resolved.Endpoint.SessionName == "" {
+		return tmux.WorkspaceSession{
+			Endpoint: testCanonicalSessionEndpoint(request.SessionName),
+		}, nil
+	}
+	return r.resolved, nil
 }
 
 func (r *recordingOpenWorkspaceRunner) Establish(
@@ -1224,4 +1248,180 @@ func TestOpenCmdIsolatesFromCwdConfig(t *testing.T) {
 		"open must define its own PersistentPreRunE to bypass root's cwd merge")
 	require.NoError(t, openCmd.PersistentPreRunE(openCmd, nil),
 		"open's PersistentPreRunE must be a no-op that never errors")
+}
+
+type guardedBranchChangeOpen struct {
+	worktreePath    string
+	generation      string
+	retainedSession string
+	project         models.Project
+	runner          *recordingOpenWorkspaceRunner
+}
+
+// setupGuardedBranchChangeOpen registers a project whose worktree switched
+// branches after its tmux session was created. The live session keeps the
+// name derived from the original branch, which inventory reports.
+func setupGuardedBranchChangeOpen(t *testing.T) guardedBranchChangeOpen {
+	t.Helper()
+	repoPath := newTUITestRepo(t)
+	worktreePath := filepath.Join(t.TempDir(), "guarded-worktree")
+	runTUITestGit(t, repoPath, "worktree", "add", "-b", "feat-58", worktreePath)
+	initCommandTestConfig(t, t.TempDir())
+	configPath := filepath.Join(os.Getenv("KWT_HOME"), "config.toml")
+	file, err := os.OpenFile(configPath, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = fmt.Fprintf(
+		file,
+		"\n[[projects]]\nrepository = 'github.com/acme/widget'\nname = 'widget'\npath = %q\n",
+		repoPath,
+	)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	snapshot, err := config.LoadGlobalSnapshotAt(os.Getenv("KWT_HOME"))
+	require.NoError(t, err)
+	require.Len(t, snapshot.Projects, 1)
+	fingerprint, err := snapshot.Projects[0].Fingerprint()
+	require.NoError(t, err)
+
+	info, ok := url.CanonicalRepositoryInfo("github.com/acme/widget")
+	require.True(t, ok)
+	retainedSession := tmux.WorkspaceSessionName(info, "feat-58", worktreePath)
+	runTUITestGit(t, worktreePath, "switch", "-c", "main-follow-up")
+	require.NotEqual(
+		t,
+		retainedSession,
+		tmux.WorkspaceSessionName(info, "main-follow-up", worktreePath),
+	)
+	generation := tuiTestWorktreeGeneration(t, repoPath, worktreePath)
+
+	runner := &recordingOpenWorkspaceRunner{
+		resolved: tmux.WorkspaceSession{
+			Endpoint: testCanonicalSessionEndpoint(retainedSession),
+			Live:     true,
+		},
+		endpoint: testCanonicalSessionEndpoint(retainedSession),
+	}
+	originalRunner := newOpenWorkspaceRunner
+	originalLayout := openLayout
+	originalSelectLayout := openSelectLayout
+	originalExpectedRepository := openExpectedRepository
+	originalExpectedRegistration := openExpectedRegistration
+	originalExpectedGeneration := openExpectedGeneration
+	originalExpectedSession := openExpectedSession
+	t.Cleanup(func() {
+		newOpenWorkspaceRunner = originalRunner
+		openLayout = originalLayout
+		openSelectLayout = originalSelectLayout
+		openExpectedRepository = originalExpectedRepository
+		openExpectedRegistration = originalExpectedRegistration
+		openExpectedGeneration = originalExpectedGeneration
+		openExpectedSession = originalExpectedSession
+	})
+	newOpenWorkspaceRunner = func([]string) openWorkspaceRunner { return runner }
+	openLayout = tmux.BlankLayoutName
+	openSelectLayout = false
+	openExpectedRepository = "github.com/acme/widget"
+	openExpectedRegistration = fingerprint
+	openExpectedGeneration = generation
+	openExpectedSession = retainedSession
+	return guardedBranchChangeOpen{
+		worktreePath:    worktreePath,
+		generation:      generation,
+		retainedSession: retainedSession,
+		project:         snapshot.Projects[0].Effective,
+		runner:          runner,
+	}
+}
+
+func (g guardedBranchChangeOpen) open(t *testing.T, startSession bool) error {
+	t.Helper()
+	entry, err := discovery.DiscoverWorktree(
+		g.worktreePath,
+		[]models.Project{g.project},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	return openSelectedWorktree(
+		context.Background(),
+		&CommandContext{Config: &models.Config{}},
+		entry,
+		nil,
+		startSession,
+		false,
+	)
+}
+
+func TestExpectedOpenUsesRetainedSessionAfterBranchChange(t *testing.T) {
+	for _, startSession := range []bool{false, true} {
+		t.Run(map[bool]string{false: "attach", true: "start only"}[startSession], func(t *testing.T) {
+			guarded := setupGuardedBranchChangeOpen(t)
+
+			err := guarded.open(t, startSession)
+
+			require.NoError(t, err)
+			assert.Equal(t, utils.PathKey(guarded.worktreePath), utils.PathKey(guarded.runner.resolveRequest.WorkspacePath))
+			assert.Equal(t, guarded.generation, guarded.runner.resolveRequest.WorkspaceGeneration)
+			assert.True(t, guarded.runner.ensured)
+			assert.Equal(t, guarded.generation, guarded.runner.generation)
+			assert.Equal(t, startSession, !guarded.runner.attached)
+			if !startSession {
+				assert.Equal(
+					t,
+					testCanonicalSessionEndpoint(guarded.retainedSession),
+					guarded.runner.attachedEndpoint,
+				)
+			}
+		})
+	}
+}
+
+func TestExpectedOpenRejectsMismatchedSessionAfterBranchChange(t *testing.T) {
+	for _, startSession := range []bool{false, true} {
+		t.Run(map[bool]string{false: "attach", true: "start only"}[startSession], func(t *testing.T) {
+			guarded := setupGuardedBranchChangeOpen(t)
+			info, ok := url.CanonicalRepositoryInfo("github.com/acme/widget")
+			require.True(t, ok)
+			openExpectedSession = tmux.WorkspaceSessionName(
+				info, "someone-else", guarded.worktreePath,
+			)
+
+			err := guarded.open(t, startSession)
+
+			assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
+			assert.False(t, guarded.runner.ensured)
+			assert.False(t, guarded.runner.attached)
+		})
+	}
+}
+
+func TestExpectedOpenRejectsStaleGenerationAfterBranchChange(t *testing.T) {
+	for _, startSession := range []bool{false, true} {
+		t.Run(map[bool]string{false: "attach", true: "start only"}[startSession], func(t *testing.T) {
+			guarded := setupGuardedBranchChangeOpen(t)
+			openExpectedGeneration = "fedcba9876543210fedcba9876543210"
+			require.NotEqual(t, guarded.generation, openExpectedGeneration)
+
+			err := guarded.open(t, startSession)
+
+			assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
+			assert.False(t, guarded.runner.ensured)
+			assert.False(t, guarded.runner.attached)
+		})
+	}
+}
+
+func TestExpectedOpenRejectsEndpointThatDiffersFromResolvedSession(t *testing.T) {
+	guarded := setupGuardedBranchChangeOpen(t)
+	info, ok := url.CanonicalRepositoryInfo("github.com/acme/widget")
+	require.True(t, ok)
+	// The retained session ended between resolution and establishment, so
+	// establishment created a session under the current branch's name.
+	guarded.runner.endpoint = testCanonicalSessionEndpoint(
+		tmux.WorkspaceSessionName(info, "main-follow-up", guarded.worktreePath),
+	)
+
+	err := guarded.open(t, false)
+
+	assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
+	assert.False(t, guarded.runner.attached)
 }

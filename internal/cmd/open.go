@@ -39,6 +39,7 @@ var (
 )
 
 type openWorkspaceRunner interface {
+	Resolve(context.Context, tmux.WorkspaceEndpointRequest) (tmux.WorkspaceSession, error)
 	Establish(context.Context, string, string, models.Layout) (tmux.SessionEndpoint, error)
 	EstablishWithGeneration(context.Context, string, string, string, models.Layout) (tmux.SessionEndpoint, error)
 	Attach(context.Context, tmux.SessionEndpoint) error
@@ -555,15 +556,9 @@ func openExpectedWorktree(
 		if discoverErr != nil || current == nil || current.RepositoryInfo == nil {
 			return registrationChangedOpenError(discoverErr)
 		}
-		currentSession := tmux.WorkspaceSessionName(
-			current.RepositoryInfo,
-			current.Branch,
-			current.Path,
-		)
 		if utils.PathKey(current.Path) != utils.PathKey(entry.Path) ||
 			!lifecycle.EqualProjectIdentity(current.RepositoryInfo.FullPath, openExpectedRepository) ||
-			current.Generation != openExpectedGeneration ||
-			currentSession != openExpectedSession {
+			current.Generation != openExpectedGeneration {
 			return registrationChangedOpenError(nil)
 		}
 		_, generationErr := withCurrentWorktreeSession(
@@ -574,7 +569,19 @@ func openExpectedWorktree(
 			[]models.Project{guard.claim.Registration.Effective},
 			protectedNames,
 			func(lockedSession string) error {
-				if lockedSession != openExpectedSession {
+				// Inventory reports the resolved endpoint. A live session
+				// keeps the name of the branch it was created on, so the
+				// expected session is compared to that endpoint rather than
+				// to the name derived from the current branch.
+				resolved, resolveErr := runner.Resolve(ctx, tmux.WorkspaceEndpointRequest{
+					SessionName:         lockedSession,
+					WorkspacePath:       current.Path,
+					WorkspaceGeneration: openExpectedGeneration,
+				})
+				if resolveErr != nil {
+					return resolveErr
+				}
+				if resolved.Endpoint.SessionName != openExpectedSession {
 					return registrationChangedOpenError(nil)
 				}
 				if err := acknowledgeRemoteSourcePath(current.Path); err != nil {
@@ -583,12 +590,18 @@ func openExpectedWorktree(
 				var establishErr error
 				endpoint, establishErr = runner.EstablishWithGeneration(
 					ctx,
-					openExpectedSession,
+					lockedSession,
 					current.Path,
 					openExpectedGeneration,
 					layout,
 				)
-				return establishErr
+				if establishErr != nil {
+					return establishErr
+				}
+				if endpoint.SessionName != openExpectedSession {
+					return registrationChangedOpenError(nil)
+				}
+				return nil
 			},
 		)
 		var conditionErr *shared.ConditionError
