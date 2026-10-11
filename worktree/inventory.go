@@ -245,7 +245,9 @@ func HasExactWorktreeRoot(entries []Entry, path string) bool {
 // identities or taking a mutation lock. It is an advisory path lookup, including
 // when application policy needs it while a Scope is already held. A bare
 // repository returns its bare root, or the main checkout beside a
-// conventional .bare control directory.
+// conventional .bare control directory. A Git directory named .git always
+// reports its parent, even when the repository is bare: Git's own worktree
+// list names that parent, and kwt registers and matches projects by it.
 func (r *Repository) PrimaryPath(ctx context.Context) (string, error) {
 	dir, err := r.run(ctx, r.path, "rev-parse", "--absolute-git-dir")
 	if err != nil {

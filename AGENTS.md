@@ -41,7 +41,9 @@ Keep app JSON models as projections of inventory and pass a held `Scope` to
 callbacks that need more Git facts. `PrimaryPath` is an advisory path lookup
 that neither acquires the mutation lock nor initializes generation files. A
 bare repository's primary path is its bare root, or `main` beside `.bare`; it is
-never empty. Default-base selection stays within the Git 2.20 baseline, so do
+never empty. A Git directory named `.git` reports its parent even when bare,
+matching `git worktree list` and kwt's project registration; this is intended
+(`internal/git/git_test.go::TestBareRepositoryInventory`). Default-base selection stays within the Git 2.20 baseline, so do
 not route it through `worktree list --expire`.
 
 Removal claims receive cleanup effects before committing registry changes.
