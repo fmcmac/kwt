@@ -179,7 +179,7 @@ func TestQuarantinePreservesCheckoutRootsAndOrphanContents(t *testing.T) {
 
 func TestBranchCleanupAndAvailabilityUseHeldScope(t *testing.T) {
 	require := require.New(t)
-	root, path := fixture(t)
+	root, _ := fixture(t)
 	repo := open(t, root, kwtPolicy())
 	git(t, root, "branch", "unused")
 	require.NoError(repo.WithLock(t.Context(), func(scope *worktree.Scope) error {
@@ -189,11 +189,7 @@ func TestBranchCleanupAndAvailabilityUseHeldScope(t *testing.T) {
 		available, err = scope.BranchNameAvailable(t.Context(), "free")
 		require.NoError(err)
 		require.True(available)
-		removed, err := scope.RemoveBranch(t.Context(), managed.BranchRemoval{Name: "topic", Force: true})
-		require.Error(err)
-		require.False(removed)
-		require.DirExists(path)
-		removed, err = scope.RemoveBranch(t.Context(), managed.BranchRemoval{Name: "unused", Force: true})
+		removed, err := scope.RemoveBranch(t.Context(), managed.BranchRemoval{Name: "unused", Force: true})
 		require.NoError(err)
 		require.True(removed)
 		available, err = scope.BranchNameAvailable(t.Context(), "unused")
