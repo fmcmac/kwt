@@ -288,12 +288,33 @@ func TestScopedTrackingUsesRepositoryExecutionAndPreservesExistingUpstream(t *te
 	git(t, origin, "clone", origin, clone)
 	git(t, clone, "branch", "--track", "available", "origin/main")
 	git(t, clone, "config", "push.default", "simple")
-	repo := open(t, clone, kwtPolicy())
+	// A distinctive policy shows whether tracking runs through the
+	// repository's execution or falls back to Kit's default runner.
+	const policyKey = "kwt.test.execution"
+	var tracking, foreign int
+	recording := false
+	coordinator, err := worktree.NewCoordinator(kwtPolicy())
+	require.NoError(t, err)
+	repo, err := coordinator.Open(t.Context(), worktree.RepositoryOptions{Path: clone, Runner: gitcmd.New().WithConfig(policyKey, "repository"), RunGit: func(ctx context.Context, runner gitcmd.Runner, dir string, args ...string) ([]byte, error) {
+		if recording && slices.Contains(args, "branch.available.merge") {
+			if slices.ContainsFunc(runner.Config, func(entry gitcmd.Config) bool { return entry.Key == policyKey }) {
+				tracking++
+			} else {
+				foreign++
+			}
+		}
+		return runner.Output(ctx, dir, args...)
+	}})
+	require.NoError(t, err)
 	created, err := repo.Create(t.Context(), worktree.CreateRequest{Git: managed.CreateWorktreeOptions{Path: filepath.Join(t.TempDir(), "attached"), Branch: "available", Mode: managed.CheckoutExistingBranch, Checkout: managed.CheckoutIsolated, Upstream: managed.UpstreamPolicy{Action: managed.UpstreamLeave}}})
 	require.NoError(t, err)
+	recording = true
 	require.NoError(t, repo.WithLock(t.Context(), func(scope *worktree.Scope) error {
 		return scope.SetUpstream(t.Context(), managed.WorktreeUpstreamOptions{Path: created.Path, Policy: managed.UpstreamPolicy{Action: managed.UpstreamTrack, Remote: "origin", Ref: "refs/heads/main", ConfigurePush: true}})
 	}))
+	recording = false
+	require.Positive(t, tracking, "upstream writes must run through the repository's RunGit")
+	require.Zero(t, foreign, "upstream writes must keep the repository's execution policy")
 	require.Equal(t, "refs/remotes/origin/main", git(t, created.Path, "rev-parse", "--symbolic-full-name", "@{upstream}"))
 	require.Equal(t, "upstream", git(t, created.Path, "config", "push.default"))
 	require.Equal(t, "simple", git(t, clone, "config", "push.default"))
