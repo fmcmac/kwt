@@ -82,6 +82,16 @@ func (c *Coordinator) Open(ctx context.Context, opts RepositoryOptions) (*Reposi
 	if strings.TrimSpace(opts.Path) == "" {
 		return nil, errors.New("worktree repository path is required")
 	}
+	// Registration paths derived from the repository are written into
+	// checkouts, so they must not depend on the caller's working directory.
+	// Abs leaves symlinks alone; each lock policy chooses how to resolve them.
+	if !filepath.IsAbs(opts.Path) {
+		absolute, err := filepath.Abs(opts.Path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve worktree repository path: %w", err)
+		}
+		opts.Path = absolute
+	}
 	r := &Repository{coordinator: c, path: opts.Path, runner: opts.Runner, runGit: opts.RunGit}
 	// One rev-parse answers both questions; Git prints them in option order.
 	out, err := r.run(ctx, opts.Path, "rev-parse", "--git-common-dir", "--is-bare-repository")

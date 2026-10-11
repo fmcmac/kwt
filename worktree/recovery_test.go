@@ -254,3 +254,21 @@ func TestSyncBaseSkipsBranchCheckedOutDuringBackup(t *testing.T) {
 	require.Equal(t, local, git(t, root, "rev-parse", "topic"))
 	require.Equal(t, local, git(t, path, "rev-parse", "HEAD"))
 }
+
+// Applications may open a repository through a relative path such as ".".
+// Reconstruction writes the registration path into the restored checkout,
+// where a relative path would resolve against the wrong directory.
+func TestRecoveryThroughRelativeRepositoryPath(t *testing.T) {
+	root, path := fixture(t)
+	head := git(t, path, "rev-parse", "HEAD")
+	require.NoError(t, os.RemoveAll(path))
+	t.Chdir(root)
+	repo := open(t, ".", kwtPolicy())
+
+	result, err := repo.Recover(t.Context(), worktree.RecoveryRequest{Path: path, Mode: worktree.ReconstructRegistered})
+
+	require.NoError(t, err)
+	require.Equal(t, worktree.Recovered, result.Disposition)
+	require.Equal(t, head, git(t, path, "rev-parse", "HEAD"))
+	require.Equal(t, "topic", git(t, path, "branch", "--show-current"))
+}
