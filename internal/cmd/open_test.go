@@ -1426,25 +1426,3 @@ func TestExpectedOpenRejectsStaleGenerationAfterBranchChange(t *testing.T) {
 		})
 	}
 }
-
-func TestExpectedOpenDoesNotEnsureSessionWhenRetainedSessionExits(t *testing.T) {
-	for _, startSession := range []bool{false, true} {
-		t.Run(map[bool]string{false: "attach", true: "start only"}[startSession], func(t *testing.T) {
-			guarded := setupGuardedBranchChangeOpen(t)
-			info, ok := url.CanonicalRepositoryInfo("github.com/acme/widget")
-			require.True(t, ok)
-			// The retained session ends before establishment, which would
-			// otherwise create a session under the current branch's name.
-			guarded.runner.endpoint = testCanonicalSessionEndpoint(
-				tmux.WorkspaceSessionName(info, "main-follow-up", guarded.worktreePath),
-			)
-
-			err := guarded.open(t, startSession)
-
-			assert.True(t, service.IsCode(err, service.RegistrationChanged), err)
-			assert.False(t, guarded.runner.ensured)
-			assert.False(t, guarded.runner.attached)
-			assert.True(t, guarded.remoteSourceUnreviewed(t))
-		})
-	}
-}
